@@ -87,16 +87,38 @@ export interface IActivity extends IObject {
 	};
 }
 
+// https://www.w3.org/TR/activitystreams-vocabulary/#dfn-collection
 export interface ICollection extends IObject {
 	type: 'Collection';
 	totalItems: number;
+	current?: ICollectionPage | string;
+	first?: ICollectionPage | string;
+	last?: ICollectionPage | string;
 	items: ApObject;
 }
 
-export interface IOrderedCollection extends IObject {
+// https://www.w3.org/TR/activitystreams-vocabulary/#dfn-orderedcollection
+export interface IOrderedCollection extends Omit<ICollection, 'type'> {
 	type: 'OrderedCollection';
-	totalItems: number;
+
+	// orderedItems is not defined well
+	// https://github.com/w3c/activitystreams/issues/494
 	orderedItems: ApObject;
+}
+
+
+// https://www.w3.org/TR/activitystreams-vocabulary/#dfn-collectionpage
+export interface ICollectionPage extends Omit<ICollection, 'type'> {
+	type: 'CollectionPage';
+	partOf?: ICollection | string;
+	next?: ICollectionPage | string;
+	prev?: ICollectionPage | string;
+}
+
+// https://www.w3.org/TR/activitystreams-vocabulary/#dfn-orderedcollectionpage
+export interface IOrderedCollectionPage extends Omit<IOrderedCollection, 'type'>, Omit<ICollectionPage, 'type'> {
+	type: 'OrderedCollectionPage';
+	startIndex: number,
 }
 
 export const validPost = ['Note', 'Question', 'Article', 'Audio', 'Document', 'Image', 'Page', 'Video', 'Event'];
@@ -185,6 +207,9 @@ export const isOrderedCollection = (object: IObject): object is IOrderedCollecti
 
 export const isCollectionOrOrderedCollection = (object: IObject): object is ICollection | IOrderedCollection =>
 	isCollection(object) || isOrderedCollection(object);
+
+export const isOrderedCollectionPage = (object: IObject): object is IOrderedCollectionPage =>
+	getApType(object) === 'OrderedCollectionPage';
 
 export interface IApPropertyValue extends IObject {
 	type: 'PropertyValue';

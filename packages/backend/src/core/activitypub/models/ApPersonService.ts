@@ -34,7 +34,7 @@ import { MetaService } from '@/core/MetaService.js';
 import { DriveFileEntityService } from '@/core/entities/DriveFileEntityService.js';
 import type { AccountMoveService } from '@/core/AccountMoveService.js';
 import { checkHttps } from '@/misc/check-https.js';
-import { getApId, getApType, getOneApHrefNullable, isActor, isCollection, isCollectionOrOrderedCollection, isPropertyValue } from '../type.js';
+import { getApId, getApType, getOneApHrefNullable, isActor, isCollection, isCollectionOrOrderedCollection, isOrderedCollection, isOrderedCollectionPage, isPropertyValue } from '../type.js';
 import { extractApHashtags } from './tag.js';
 import type { OnModuleInit } from '@nestjs/common';
 import type { ApNoteService } from './ApNoteService.js';
@@ -281,7 +281,7 @@ export class ApPersonService implements OnModuleInit {
 		// Create user
 		let user: RemoteUser;
 		try {
-		// Start transaction
+			// Start transaction
 			await this.db.transaction(async transactionalEntityManager => {
 				user = await transactionalEntityManager.save(new User({
 					id: this.idService.genId(),
@@ -327,9 +327,9 @@ export class ApPersonService implements OnModuleInit {
 				}
 			});
 		} catch (e) {
-		// duplicate key error
+			// duplicate key error
 			if (isDuplicateKeyValueError(e)) {
-			// /users/@a => /users/:id のように入力がaliasなときにエラーになることがあるのを対応
+				// /users/@a => /users/:id のように入力がaliasなときにエラーになることがあるのを対応
 				const u = await this.usersRepository.findOneBy({
 					uri: person.id,
 				});
@@ -406,7 +406,10 @@ export class ApPersonService implements OnModuleInit {
 		});
 		//#endregion
 
-		await this.updateFeatured(user!.id, resolver).catch(err => this.logger.error(err));
+		await Promise.all([
+			this.updateFeatured(user!.id, resolver),
+			this.updateOutboxFirstPage(person, resolver),
+		]).catch(err => this.logger.error(err));
 
 		return user!;
 	}
@@ -415,7 +418,7 @@ export class ApPersonService implements OnModuleInit {
 	 * Personの情報を更新します。
 	 * Misskeyに対象のPersonが登録されていなければ無視します。
 	 * もしアカウントの移行が確認された場合、アカウント移行処理を行います。
-	 * 
+	 *
 	 * @param uri URI of Person
 	 * @param resolver Resolver
 	 * @param hint Hint of Person object (この値が正当なPersonの場合、Remote resolveをせずに更新に利用します)
@@ -498,7 +501,7 @@ export class ApPersonService implements OnModuleInit {
 			(!exist.movedToUri && updates.movedToUri) ||
 			// 移行先がある→別のもの
 			(exist.movedToUri !== updates.movedToUri && exist.movedToUri && updates.movedToUri);
-			// 移行先がある→ない、ない→ないは無視
+		// 移行先がある→ない、ない→ないは無視
 
 		if (moving) updates.movedAt = new Date();
 
@@ -598,9 +601,9 @@ export class ApPersonService implements OnModuleInit {
 	@bindThis
 	public analyzeAttachments(attachments: IObject | IObject[] | undefined) {
 		const fields: {
-		name: string,
-		value: string
-	}[] = [];
+			name: string,
+			value: string
+		}[] = [];
 		if (Array.isArray(attachments)) {
 			for (const attachment of attachments.filter(isPropertyValue)) {
 				fields.push({
@@ -613,8 +616,41 @@ export class ApPersonService implements OnModuleInit {
 		return { fields };
 	}
 
+	/**
+	 * Retrieve outbox from an actor object.
+	 *
+	 * This only retrieves the first page for now.
+	 */
+	public async updateOutboxFirstPage(actor: IActor, resolver: Resolver): Promise<void> {
+		// https://www.w3.org/TR/activitypub/#actor-objects
+		// Outbox is a required property for all actors
+		if (!actor.outbox) {
+			throw new Error('No outbox property');
+		}
+
+		this.logger.info(`Updating the featured: ${actor.url}`);
+
+		const collection = await resolver.resolveCollection(actor.outbox);
+		if (!isOrderedCollection(collection)) {
+			throw new Error('Outbox must be an ordered collection');
+		}
+
+		const firstPage = collection.first ? await resolver.resolveCollection(collection.first) : collection;
+		if (!isOrderedCollection(firstPage) && !isOrderedCollectionPage(firstPage)) {
+			throw new Error('Outbox page must be an ordered collection page');
+		}
+
+		const items = await Promise.all(
+			toArray(firstPage.orderedItems)
+				.slice(0, 100) // Set some limit as the remote may send an unreasonably large collection
+				.map(x => resolver.resolve(x)),
+		);
+
+		await this.resolveNotes(items, resolver);
+	}
+
 	@bindThis
-	public async updateFeatured(userId: User['id'], resolver?: Resolver) {
+	public async updateFeatured(userId: User['id'], resolver?: Resolver): Promise<void> {
 		const user = await this.usersRepository.findOneByOrFail({ id: userId });
 		if (!this.userEntityService.isRemoteUser(user)) return;
 		if (!user.featured) return;
@@ -631,12 +667,8 @@ export class ApPersonService implements OnModuleInit {
 		const unresolvedItems = isCollection(collection) ? collection.items : collection.orderedItems;
 		const items = await Promise.all(toArray(unresolvedItems).map(x => _resolver.resolve(x)));
 
-		// Resolve and regist Notes
-		const limit = promiseLimit<Note | null>(2);
-		const featuredNotes = await Promise.all(items
-			.filter(item => getApType(item) === 'Note')	// TODO: Noteでなくてもいいかも
-			.slice(0, 5)
-			.map(item => limit(() => this.apNoteService.resolveNote(item, _resolver))));
+		// Resolve and register Notes
+		const featuredNotes = await this.resolveNotes(items, _resolver);
 
 		await this.db.transaction(async transactionalEntityManager => {
 			await transactionalEntityManager.delete(UserNotePining, { userId: user.id });
@@ -653,6 +685,14 @@ export class ApPersonService implements OnModuleInit {
 				});
 			}
 		});
+	}
+
+	public async resolveNotes(items: IObject[], resolver: Resolver): Promise<(Note | null)[]> {
+		const limit = promiseLimit<Note | null>(2);
+		return await Promise.all(items
+			.filter(item => getApType(item) === 'Note')	// TODO: Noteでなくてもいいかも
+			.slice(0, 5)
+			.map(item => limit(() => this.apNoteService.resolveNote(item, resolver))));
 	}
 
 	/**
@@ -688,7 +728,7 @@ export class ApPersonService implements OnModuleInit {
 			// (uriが存在しなかったり応答がなかったりする場合resolvePersonはthrow Errorする)
 			dst = await this.resolvePerson(src.movedToUri);
 		}
- 
+
 		if (dst.movedToUri === dst.uri) return 'skip: movedTo itself (dst)'; // ？？？
 		if (src.movedToUri !== dst.uri) return 'skip: missmatch uri'; // ？？？
 		if (dst.movedToUri === src.uri) return 'skip: dst.movedToUri === src.uri';
